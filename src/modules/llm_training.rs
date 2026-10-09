@@ -122,7 +122,7 @@ impl Module for LlmTraining {
         csleep(500).await;
 
         // downloads model files
-        let file_sizes = vec![
+        let file_sizes: Vec<u64> = vec![
             rng.random_range(400_000..3_000_000),
             rng.random_range(10_000..80_000),
             rng.random_range(200_000_000..7_000_000_000),
@@ -133,6 +133,10 @@ impl Module for LlmTraining {
         let step_ms = 100u64;
 
         for &file_size in &file_sizes {
+            // Track progress in KiB so totals and frame calculations fit in wasm32's usize.
+            let file_size_kib = file_size.div_ceil(1024);
+            let file_size = file_size_kib * 1024;
+
             let speed = rng.random_range(1_000_000..80_000_000);
             let simulated_total_secs = (file_size / speed).max(1);
 
@@ -142,7 +146,7 @@ impl Module for LlmTraining {
                 .suffix("/s");
 
             run_progress_bar(
-                file_size as usize,
+                file_size_kib as usize,
                 bar_steps as u32,
                 step_ms,
                 simulated_total_secs,
@@ -155,7 +159,7 @@ impl Module for LlmTraining {
                     } else {
                         format!(
                             "{pct:>3.0}%{bar} {downloaded}/{total} [{elapsed}<{eta}, {speed}]",
-                            downloaded = format_size(downloaded as u64, size_opts),
+                            downloaded = format_size(downloaded as u64 * 1024, size_opts),
                             total = format_size(file_size, size_opts),
                             elapsed = format_secs_as_mm_ss(elapsed_secs),
                             eta = format_secs_as_mm_ss(remaining_secs),

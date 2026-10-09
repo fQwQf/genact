@@ -171,6 +171,11 @@ impl Module for LlmTraining {
             )
             .await;
 
+            if appconfig.should_exit() {
+                newline().await;
+                return;
+            }
+
             newline().await;
         }
 
@@ -217,6 +222,11 @@ impl Module for LlmTraining {
                 appconfig,
             )
             .await;
+
+            if appconfig.should_exit() {
+                newline().await;
+                return;
+            }
 
             let prev_loss = loss;
             loss -= rng.random_range(0.3..0.8);
@@ -273,6 +283,11 @@ impl Module for LlmTraining {
             appconfig,
         )
         .await;
+
+        if appconfig.should_exit() {
+            newline().await;
+            return;
+        }
 
         newline().await;
 

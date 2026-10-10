@@ -212,8 +212,9 @@ impl Module for LlmTraining {
                         )
                     } else {
                         let it_per_s = step as f64 / elapsed_secs;
-                        let step_loss =
-                            loss - rng.random_range(0.0..0.2) * step as f64 / steps_per_epoch as f64;
+                        let step_loss = (loss
+                            - rng.random_range(0.0..0.2) * step as f64 / steps_per_epoch as f64)
+                            .max(0.05);
                         format!(
                             "Epoch {epoch}/{num_epochs}: {pct:>3.0}%{bar} {step}/{steps_per_epoch} [{elapsed}<{eta}, {it:.2}it/s, loss={loss:.4}]",
                             elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
@@ -237,8 +238,8 @@ impl Module for LlmTraining {
             loss = loss.max(0.05);
             newline().await;
 
-            // randomly triggers checkpoint saves to persist the model state
-            if rng.random_bool(0.4) {
+            // Occasionally save a checkpoint when the loss improves.
+            if loss < prev_loss && rng.random_bool(0.4) {
                 let checkpoint_step = epoch * steps_per_epoch;
                 print(format!(
                     "[CHECKPOINT] Model improved ({prev_loss:.4} -> {loss:.4}). Saving model to ./output/checkpoint-{checkpoint_step}..."

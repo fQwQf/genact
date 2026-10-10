@@ -1,6 +1,7 @@
 //! Pretend to train an LLM
 use async_trait::async_trait;
 use humansize::{FormatSizeOptions, format_size};
+use instant::Instant;
 use rand::RngExt;
 use rand::rng;
 use rand::seq::IndexedRandom;
@@ -24,19 +25,12 @@ fn format_secs_as_mm_ss(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
-/// Runs a progress bar animation with the given parameters.
-/// `render` is called for each frame with
-/// (frame_index, step, pct, elapsed_secs, remaining_secs, bar)
-/// and should return the string to print.
-async fn run_progress_bar<F>(
-    total: usize,
-    bar_steps: u32,
-    step_ms: u64,
-    simulated_total_secs: u64,
-    mut render: F,
-    appconfig: &AppConfig,
-) where
-    F: FnMut(u32, usize, f64, u64, u64, &progress_string::Bar) -> String,
+/// Advances work at `units_per_sec`, waiting through `csleep` between updates.
+/// `render` receives (step, pct, elapsed_secs, remaining_secs, bar).
+/// Elapsed time is measured; ETA is unknown until some work has completed.
+async fn run_progress_bar<F>(total: usize, units_per_sec: f64, mut render: F, appconfig: &AppConfig)
+where
+    F: FnMut(usize, f64, f64, f64, &progress_string::Bar) -> String,
 {
     let mut bar = progress_string::BarBuilder::new()
         .total(total)
@@ -44,26 +38,39 @@ async fn run_progress_bar<F>(
         .width(10)
         .build();
 
-    for i in 0..=bar_steps {
-        erase_line().await;
+    let started = Instant::now();
+    let mut completed = 0.0;
 
-        let step = (total * i as usize / bar_steps as usize).min(total);
-        let pct = step as f64 / total as f64 * 100.0;
-        bar.replace(step);
-
-        let elapsed_secs = simulated_total_secs * i as u64 / bar_steps as u64;
-        let remaining_secs = simulated_total_secs * (bar_steps - i) as u64 / bar_steps as u64;
-
-        let text = render(i, step, pct, elapsed_secs, remaining_secs, &bar);
-        print(text).await;
-
-        if i < bar_steps {
-            csleep(step_ms).await;
-        }
-
+    loop {
         if appconfig.should_exit() {
             return;
         }
+
+        let step = completed as usize;
+        let pct = step as f64 / total as f64 * 100.0;
+        let elapsed_secs = started.elapsed().as_secs_f64();
+        let remaining_secs = if step > 0 {
+            elapsed_secs * (total - step) as f64 / step as f64
+        } else {
+            0.0
+        };
+
+        bar.replace(step);
+        erase_line().await;
+        print(render(step, pct, elapsed_secs, remaining_secs, &bar)).await;
+
+        if step == total {
+            return;
+        }
+
+        // Like the download module, advance by throughput times a 50 ms tick.
+        // Retain fractional units so slow progress is not rounded away each tick.
+        let next = (completed + units_per_sec * 0.05).min(total as f64);
+        // Shorten the final tick for files or jobs smaller than one full tick.
+        let tick_secs = ((total as f64 - completed) / units_per_sec).min(0.05);
+        let sleep_ms = (tick_secs * 1000.0).ceil() as u64;
+        csleep(sleep_ms.max(1)).await;
+        completed = next;
     }
 }
 
@@ -129,16 +136,13 @@ impl Module for LlmTraining {
             rng.random_range(1_000..8_000),
         ];
 
-        let bar_steps = 12u64;
-        let step_ms = 100u64;
+        // Share a connection speed across files, so larger files take longer.
+        let download_bytes_per_sec = rng.random_range(10_000_000u64..100_000_000);
 
         for &file_size in &file_sizes {
-            // Track progress in KiB so totals and frame calculations fit in wasm32's usize.
+            // Track progress in KiB so file sizes fit in wasm32's usize.
             let file_size_kib = file_size.div_ceil(1024);
             let file_size = file_size_kib * 1024;
-
-            let speed = rng.random_range(1_000_000..80_000_000);
-            let simulated_total_secs = (file_size / speed).max(1);
 
             let size_opts = FormatSizeOptions::from(humansize::BINARY).space_after_value(false);
             let speed_opts = FormatSizeOptions::from(humansize::BINARY)
@@ -147,23 +151,26 @@ impl Module for LlmTraining {
 
             run_progress_bar(
                 file_size_kib as usize,
-                bar_steps as u32,
-                step_ms,
-                simulated_total_secs,
-                move |i, downloaded, pct, elapsed_secs, remaining_secs, bar| {
-                    if i == 0 {
+                download_bytes_per_sec as f64 / 1024.0,
+                move |downloaded, pct, elapsed_secs, remaining_secs, bar| {
+                    if downloaded == 0 || elapsed_secs <= 0.0 {
                         format!(
-                            "  0%[          ] 0.00/{} [00:00<?, ?/s]",
-                            format_size(file_size, size_opts)
+                            "{pct:>3.0}%{bar} {downloaded}/{total} [{elapsed}<?, ?/s]",
+                            downloaded = format_size(downloaded as u64 * 1024, size_opts),
+                            total = format_size(file_size, size_opts),
+                            elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
                         )
                     } else {
                         format!(
                             "{pct:>3.0}%{bar} {downloaded}/{total} [{elapsed}<{eta}, {speed}]",
                             downloaded = format_size(downloaded as u64 * 1024, size_opts),
                             total = format_size(file_size, size_opts),
-                            elapsed = format_secs_as_mm_ss(elapsed_secs),
-                            eta = format_secs_as_mm_ss(remaining_secs),
-                            speed = format_size(speed, speed_opts),
+                            elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
+                            eta = format_secs_as_mm_ss(remaining_secs.ceil() as u64),
+                            speed = format_size(
+                                (downloaded as f64 * 1024.0 / elapsed_secs) as u64,
+                                speed_opts,
+                            ),
                         )
                     }
                 },
@@ -189,31 +196,28 @@ impl Module for LlmTraining {
         let steps_per_epoch = rng.random_range(500..2000);
         let mut loss = rng.random_range(3.0..5.0);
 
-        let epoch_bar_steps = 12u32;
-        let epoch_step_ms = 80u64;
-
-        let simulated_epoch_secs = rng.random_range(60..300);
+        // Keep training throughput consistent across epochs of the same run.
+        let training_steps_per_sec = rng.random_range(10.0..40.0);
 
         // do the training process over a random number of epochs with progress bars
         for epoch in 1..=num_epochs {
             run_progress_bar(
                 steps_per_epoch as usize,
-                epoch_bar_steps,
-                epoch_step_ms,
-                simulated_epoch_secs,
-                |i, step, pct, elapsed_secs, remaining_secs, bar| {
-                    if i == 0 {
+                training_steps_per_sec,
+                |step, pct, elapsed_secs, remaining_secs, bar| {
+                    if step == 0 || elapsed_secs <= 0.0 {
                         format!(
-                            "Epoch {epoch}/{num_epochs}:   0%[          ] 0/{steps_per_epoch} [00:00<?, ?it/s]"
+                            "Epoch {epoch}/{num_epochs}: {pct:>3.0}%{bar} {step}/{steps_per_epoch} [{elapsed}<?, ?it/s]",
+                            elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
                         )
                     } else {
-                        let it_per_s = step as f64 / elapsed_secs.max(1) as f64;
+                        let it_per_s = step as f64 / elapsed_secs;
                         let step_loss =
-                            loss - rng.random_range(0.0..0.2) * i as f64 / epoch_bar_steps as f64;
+                            loss - rng.random_range(0.0..0.2) * step as f64 / steps_per_epoch as f64;
                         format!(
                             "Epoch {epoch}/{num_epochs}: {pct:>3.0}%{bar} {step}/{steps_per_epoch} [{elapsed}<{eta}, {it:.2}it/s, loss={loss:.4}]",
-                            elapsed = format_secs_as_mm_ss(elapsed_secs),
-                            eta = format_secs_as_mm_ss(remaining_secs),
+                            elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
+                            eta = format_secs_as_mm_ss(remaining_secs.ceil() as u64),
                             it = it_per_s,
                             loss = step_loss,
                         )
@@ -255,27 +259,24 @@ impl Module for LlmTraining {
         }
 
         let val_steps = rng.random_range(50..300);
-        let val_simulated_secs = rng.random_range(3..15);
-        let val_bar_steps = 12u32;
-        let val_step_ms = 80u64;
+        let validation_steps_per_sec = rng.random_range(30.0..100.0);
 
         // we do a validation step after training
         run_progress_bar(
             val_steps as usize,
-            val_bar_steps,
-            val_step_ms,
-            val_simulated_secs,
-            |i, step, pct, elapsed_secs, remaining_secs, bar| {
-                if i == 0 {
+            validation_steps_per_sec,
+            |step, pct, elapsed_secs, remaining_secs, bar| {
+                if step == 0 || elapsed_secs <= 0.0 {
                     format!(
-                        "Validating:   0%[          ] 0/{val_steps} [00:00<?, ?it/s]"
+                        "Validating: {pct:>3.0}%{bar} {step}/{val_steps} [{elapsed}<?, ?it/s]",
+                        elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
                     )
                 } else {
-                    let it_per_s = step as f64 / elapsed_secs.max(1) as f64;
+                    let it_per_s = step as f64 / elapsed_secs;
                     format!(
                         "Validating: {pct:>3.0}%{bar} {step}/{val_steps} [{elapsed}<{eta}, {it:.2}it/s]",
-                        elapsed = format_secs_as_mm_ss(elapsed_secs),
-                        eta = format_secs_as_mm_ss(remaining_secs),
+                        elapsed = format_secs_as_mm_ss(elapsed_secs as u64),
+                        eta = format_secs_as_mm_ss(remaining_secs.ceil() as u64),
                         it = it_per_s,
                     )
                 }
